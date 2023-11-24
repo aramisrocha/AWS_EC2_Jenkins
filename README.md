@@ -1,0 +1,1 @@
+https://aws.amazon.com/pt/blogs/devops/using-jenkins-with-codeartifact/
