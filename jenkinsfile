@@ -1,0 +1,111 @@
+pipeline {
+    agent any
+    
+    triggers {
+        pollSCM '* * * * *'
+    }
+    
+    options {
+        timestamps() // Adiciona marcas de tempo aos logs
+        buildDiscarder(logRotator(numToKeepStr: '10')) // Mantém os últimos 10 builds
+    }
+
+    environment {
+        AWS_DEFAULT_REGION = 'us-east-1'
+    }
+
+    parameters {
+        string(name: 'INSTANCE_TYPE', defaultValue: 't2.micro', description: 'Tipo de instância EC2')
+    }
+
+    stages {
+        stage('Parametros para credencias') {
+            steps {
+                script {
+                    withCredentials([[
+                        $class: 'AmazonWebServicesCredentialsBinding',
+                        credentialsId: 'jenkins',
+                        accessKeyVariable: 'AWS_ACCESS_KEY_ID',
+                        secretKeyVariable: 'AWS_SECRET_ACCESS_KEY']]) {
+                        
+                        AWS_ACCESS_KEY_ID = env.AWS_ACCESS_KEY_ID
+                        AWS_SECRET_ACCESS_KEY = env.AWS_SECRET_ACCESS_KEY
+                    }
+                }
+            }
+        }
+
+        stage('Verificação de Parâmetros') {
+            steps {
+                script {
+                    if (params.INSTANCE_TYPE != 't2.micro' && params.INSTANCE_TYPE != 't2.small') {
+                        error('Tipo de instância inválido. Deve ser "t2.micro" ou "t2.small".')
+                    }
+                }
+            }
+        }
+
+        stage('Definir as zonas via matrix') {
+            matrix {
+                axes {
+                    axis {
+                        name 'ZONE'
+                        values 'us-east-1a', 'us-east-1b'
+                    }
+                }
+                stages {
+                    stage('Criar Máquina') {
+                        when {
+                            expression { params.BUILD_MACHINE == 'true' }
+                        }
+                        steps {
+                            script {
+                                sh """
+                                aws configure set aws_access_key_id ${AWS_ACCESS_KEY_ID}
+                                aws configure set aws_secret_access_key ${AWS_SECRET_ACCESS_KEY}
+                                aws ec2 run-instances --image-id ami-04cb4ca688797756f --key-name aramis_pos --instance-type ${params.INSTANCE_TYPE} --count 1 --instance-initiated-shutdown-behavior terminate --tag-specifications 'ResourceType=instance,Tags=[{Key=Name,Value=${INSTANCE_NAME}}]' --associate-public-ip-address --placement AvailabilityZone=${ZONE}
+                                """
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('Pós-Criação Enviar email usando SNS e informar IP Externo em paralelo') {
+            when {
+                expression { params.BUILD_MACHINE == 'true' }
+            }
+            steps {
+                parallel(
+                    "Enviar email via SNS": {
+                        script {
+                            sh "aws configure set aws_access_key_id ${AWS_ACCESS_KEY_ID}"
+                            sh "aws configure set aws_secret_access_key ${AWS_SECRET_ACCESS_KEY}"
+                            sh "aws sns publish --topic-arn arn:aws:sns:us-east-1:181317788381:Aramis --message 'A instância EC2 foi criada com sucesso.'"
+                        }
+                    },
+                    "Informar IP Externo": {
+                        script {
+                            sh "aws configure set aws_access_key_id ${AWS_ACCESS_KEY_ID}"
+                            sh "aws configure set aws_secret_access_key ${AWS_SECRET_ACCESS_KEY}"
+                            sh "aws ec2 describe-instances --region us-east-1 --filters 'Name=tag:Name,Values=${INSTANCE_NAME}' --query 'Reservations[0].Instances[0].PublicIpAddress' --output text"
+                        }
+                    }
+                )
+            }
+        }
+    }
+    
+    post {
+        always {
+            echo "Pipeline para a criação de duas instancias em zonas de disponibilidade diferentes"
+        }
+        success {
+            echo "Foram criadas duas instancias com sucesso em diferentes AZS"
+        }
+        failure {
+            echo "Houve algum error favor checar os logs"
+        }
+    }
+}
